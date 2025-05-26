@@ -9,7 +9,7 @@
 <img src="https://github.com/user-attachments/assets/441efae7-5d96-41b6-8a69-4a21bb0a5fc1" loading="lazy" width="45%"> <img src="https://github.com/user-attachments/assets/a4ab69a5-91e2-41dc-9a08-b3bef89bda42" loading="lazy" width="45%">
 
 # Pipeline
-<img src="https://github.com/user-attachments/assets/a893b940-91c7-4aa7-82e7-1378f28e4299" loading="lazy" width="95%"><br>
+<img src="https://github.com/user-attachments/assets/ce3f1c83-b04c-4d50-9667-c9df3d8e0d53" loading="lazy" width="95%"><br>
 ナンバープレート検出とナンバープレート認識の2ステージ構成です。
 * PlateYOLO-JP：YOLO12ベースの検出器
 * EkMixier：マルチカーネル構造とECAブロックを持つパッチエンベディング系のクラス分類器<br>※対応地域名や対応ひらがな等は、util.py の region_dict や hiragana_dict を参照ください
