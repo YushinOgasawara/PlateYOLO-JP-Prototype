@@ -12,7 +12,7 @@
 <img src="https://github.com/user-attachments/assets/ce3f1c83-b04c-4d50-9667-c9df3d8e0d53" loading="lazy" width="95%"><br>
 ナンバープレート検出とナンバープレート認識の2ステージ構成です。
 * PlateYOLO-JP：YOLO12ベースの検出器
-* EkMixier：マルチカーネル構造とECAブロックを持つパッチエンベディング系のクラス分類器<br>※対応地域名や対応ひらがな等は、util.py の region_dict や hiragana_dict を参照ください
+* EkMixier：ECAブロックとマルチカーネル構造を持つパッチエンベディング系のクラス分類器<br>※対応地域名や対応ひらがな等は、util.py の region_dict や hiragana_dict を参照ください
 
 > [!NOTE]
 > * PlateYOLO-JP は、ある程度距離が離れた車両のナンバープレート検出を想定しています<br>画面全体にナンバープレートを映した画像などは検出できません
