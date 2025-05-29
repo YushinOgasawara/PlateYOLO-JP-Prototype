@@ -66,8 +66,8 @@ python demo.py
 * --output<br>
 動画書き込み時のファイルパス<br>
 デフォルト：output.avi
-* --unuse_gpu<br>
-GPU推論なし（CPU推論）<br>
+* --use_gpu<br>
+GPU推論<br>
 デフォルト：指定なし
 * --use_privacy_mode<br>
 プライバシー表示<br>
