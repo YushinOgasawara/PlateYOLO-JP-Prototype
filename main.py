@@ -33,9 +33,9 @@ def get_args() -> argparse.Namespace:
         "--lpd",
         type=str,
         # default="weight/PlateYOLO-JP-320x320.onnx",
-        default="weight/PlateYOLO-JP-640x640.onnx",
+        # default="weight/PlateYOLO-JP-640x640.onnx",
         # default="weight/PlateYOLO-JP-1280x1280.onnx",
-        # default="weight/PlateYOLO-JP-1920x1920.onnx",
+        default="weight/PlateYOLO-JP-1920x1920.onnx",
     )
     parser.add_argument(
         "--lpr",
