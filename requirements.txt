@@ -1,0 +1,4 @@
+onnx==1.18.0
+onnxruntime==1.18.0
+opencv-python==4.11.0.86
+pillow==11.2.1
