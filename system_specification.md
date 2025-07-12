@@ -566,6 +566,3 @@ def puttext(cls, cv_image, text, point, font_path, font_size, color=(0,0,0)):
 - OpenCVの制限（日本語フォント非対応）を回避
 - PIL経由での高品質日本語描画
 - TrueTypeフォント（源泉丸ゴシック）対応
-
-## 11. 作成者
-高橋かずひと (https://twitter.com/KzhtTkhs)
