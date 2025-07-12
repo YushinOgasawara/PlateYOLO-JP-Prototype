@@ -1,0 +1,46 @@
+name: ❓ 質問
+description: 使用方法や技術的な質問
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        質問ありがとうございます。以下の情報を記入してください。
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 質問内容
+      description: 具体的な質問を記載してください
+      placeholder: 例）GPU推論を有効にする方法を教えてください
+    validations:
+      required: true
+
+  - type: textarea
+    id: current-situation
+    attributes:
+      label: 現在の状況
+      description: 現在の状況や試したことがあれば説明してください
+      placeholder: 例）demo.pyは動作するが、処理速度を向上させたい
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 環境情報
+      description: OS、Pythonバージョンなど必要に応じて記載してください
+      placeholder: |
+        - OS: Windows 11 / macOS 14 / Ubuntu 22.04
+        - Python: 3.12.1
+        - GPU: あり / なし
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: その他の情報
+      description: 参考資料、エラーメッセージなど関連情報があれば追加してください
+    validations:
+      required: false

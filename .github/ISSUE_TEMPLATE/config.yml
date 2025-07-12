@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "📖 ドキュメント・仕様書"
+    url: "https://github.com/ButTaiwan/gensen-font"
+    about: "プロジェクトの詳細な仕様はsystem_specification.mdをご確認ください"
+  - name: "💡 ディスカッション"
+    url: "https://github.com/KzhtTkhs/PlateYOLO-JP-Prototype/discussions"
+    about: "一般的な議論や、アイデアの共有はDiscussionsをご利用ください"
+  - name: "🔒 セキュリティ報告"
+    url: "mailto:security@example.com"
+    about: "セキュリティに関する問題は、イシューではなくこちらまでご連絡ください"
