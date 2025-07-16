@@ -117,6 +117,9 @@ def get_args() -> argparse.Namespace:
     
     # 日付指定オプション
     parser.add_argument("--date", type=str, help="動画ディレクトリの日付 (yyyy-mm-dd形式)")
+    
+    # ヘッドレスモードオプション
+    parser.add_argument("--headless", action="store_true", help="ヘッドレスモード（GUI無効）")
 
     # 表示設定
     parser.add_argument("--width", help="cap width", type=int, default=960)
@@ -443,9 +446,16 @@ def process_image(
         args.use_privacy_mode
     )
     
-    cv2.imshow(f"Image: {Path(image_path).name}", debug_image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # ヘッドレスモードでない場合のみGUI表示
+    if not args.headless:
+        cv2.imshow(f"Image: {Path(image_path).name}", debug_image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        # ヘッドレスモードの場合は結果を保存
+        output_path = f"processed_{Path(image_path).name}"
+        cv2.imwrite(output_path, debug_image)
+        print(f"結果を保存: {output_path}")
 
 
 def process_video_stream(
@@ -459,6 +469,7 @@ def process_video_stream(
     lpd_model, lpr_model = models
     cap_fps = cap.get(cv2.CAP_PROP_FPS)
     video_writer: Optional[cv2.VideoWriter] = None
+    frame_count = 0
     
     try:
         while True:
@@ -466,18 +477,26 @@ def process_video_stream(
             if not ret:
                 break
             
+            frame_count += 1
+            
             debug_image, lpd_time, lpr_time = process_frame(
                 frame, lpd_model, lpr_model,
                 args.lpd_score_th, args.lpr_min_width1, args.lpr_min_width2,
                 args.use_privacy_mode
             )
             
-            cv2.imshow(window_title, debug_image)
-            
-            # ESCキーで終了（カメラの場合のみ）
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
-                break
+            # ヘッドレスモードでない場合のみGUI表示
+            if not args.headless:
+                cv2.imshow(window_title, debug_image)
+                
+                # ESCキーで終了（カメラの場合のみ）
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC
+                    break
+            else:
+                # ヘッドレスモードの場合、進捗表示
+                if frame_count % 30 == 0:  # 30フレームごとに表示
+                    print(f"処理中... フレーム: {frame_count}")
             
             # 動画書き込み
             if args.use_video_writer and output_path:
@@ -495,7 +514,8 @@ def process_video_stream(
     finally:
         if video_writer:
             video_writer.release()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
 def main() -> None:
