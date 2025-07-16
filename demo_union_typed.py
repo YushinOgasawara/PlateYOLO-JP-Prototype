@@ -579,7 +579,11 @@ def main() -> None:
     except Exception as e:
         print(f"処理エラー: {e}")
     finally:
-        cv2.destroyAllWindows()
+        if not (hasattr(args, 'headless') and args.headless):
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass  # ヘッドレス環境では無視
 
 
 def draw_info(
