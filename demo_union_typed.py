@@ -16,11 +16,8 @@ except ImportError:
     print("警告: python-dotenvがインストールされていません。.envファイルは無視されます。")
     print("インストール: uv add python-dotenv")
 
-# ヘッドレス環境でのOpenCV設定
+# ヘッドレス環境でのOpenCV設定（opencv-python-headlessでは不要）
 import os
-if os.getenv('DISPLAY') is None or '--headless' in os.sys.argv:
-    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-    os.environ['DISPLAY'] = ':99'
 
 import cv2
 import numpy as np
@@ -294,7 +291,11 @@ def create_video_capture(input_source: Union[int, str], width: int, height: int)
         if file_size == 0:
             raise ValueError(f"動画ファイルが空です: {input_source}")
         
-        print(f"動画ファイル情報: {input_source} (サイズ: {file_size} bytes)")
+        # 最小ファイルサイズチェック（1KB未満はスキップ）
+        if file_size < 1024:
+            raise ValueError(f"動画ファイルが小さすぎます: {input_source} (サイズ: {file_size} bytes)")
+        
+        print(f"動画ファイル情報: {input_source} (サイズ: {file_size:,} bytes)")
         
         cap = cv2.VideoCapture(input_source)
         if not cap.isOpened():
