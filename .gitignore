@@ -181,3 +181,8 @@ sample/*
 
 # obsidian
 .obsidian/
+
+# Video files and directories
+videos/*
+outputs/*
+
