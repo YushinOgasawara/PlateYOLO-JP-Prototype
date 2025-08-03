@@ -13,6 +13,8 @@ INPUTS_DIR = "inputs"
 # =============================
 # 物体検出設定
 # =============================
+# YOLOのモデル設定
+YOLO_MODEL = "yolov8m.pt"
 
 # FPS監視の有効/無効
 PICTURE_ENABLE_FPS_MONITORING = True
