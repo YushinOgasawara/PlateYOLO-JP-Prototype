@@ -26,16 +26,16 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--video", type=str, default=None)
     parser.add_argument("--image", type=str, default=None)
-    parser.add_argument("--width", help="cap width", type=int, default=960)
-    parser.add_argument("--height", help="cap height", type=int, default=540)
+    parser.add_argument("--width", help="cap width", type=int, default=1920)
+    parser.add_argument("--height", help="cap height", type=int, default=1080)
 
     parser.add_argument(
         "--lpd",
         type=str,
         # default="weight/PlateYOLO-JP-320x320.onnx",
-        default="weight/PlateYOLO-JP-640x640.onnx",
+        # default="weight/PlateYOLO-JP-640x640.onnx",
         # default="weight/PlateYOLO-JP-1280x1280.onnx",
-        # default="weight/PlateYOLO-JP-1920x1920.onnx",
+        default="weight/PlateYOLO-JP-1920x1920.onnx",
     )
     parser.add_argument(
         "--lpr",
@@ -53,6 +53,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--use_gpu", action="store_true")
 
     parser.add_argument("--use_privacy_mode", action="store_true")
+
+    parser.add_argument("--save_image", type=str, default=None, help="Save processed image to specified path")
 
     args = parser.parse_args()
 
@@ -87,6 +89,8 @@ def main() -> None:
 
     use_privacy_mode: bool = args.use_privacy_mode
 
+    save_image_path: str = args.save_image
+
     # ONNXモデルの読み込み
     lpd_model = onnxruntime.InferenceSession(lpd_model_path, providers=providers)
     lpr_model = onnxruntime.InferenceSession(lpr_model_path, providers=providers)
@@ -104,7 +108,7 @@ def main() -> None:
     video_writer = None
 
     # ウォームアップ
-    _ = run_lpd_inference(lpd_model, np.zeros((960, 540, 3), dtype=np.uint8), 0.3)
+    _ = run_lpd_inference(lpd_model, np.zeros((1920, 1080, 3), dtype=np.uint8), 0.3)
     _ = run_lpr_inference(lpr_model, np.zeros((200, 100, 3), dtype=np.uint8))
 
     while True:
@@ -174,6 +178,12 @@ def main() -> None:
         )
 
         cv2.imshow("LPR Demo", debug_image)
+        
+        # 画像保存
+        if save_image_path is not None:
+            cv2.imwrite(save_image_path, debug_image)
+            print(f"Image saved to: {save_image_path}")
+        
         if image_path is None:
             if cv2.waitKey(1) == 27:  # ESC
                 break
@@ -213,7 +223,7 @@ def draw_info(
     lpr_min_width1,
     lpr_min_width2,
     use_privacy_mode,
-    resize_width=960,
+    resize_width=1920,
     font_path="./font/gensen-font/ttc/GenSenRounded2-B.ttc",
 ):
     debug_image = copy.deepcopy(image)

@@ -183,6 +183,9 @@ sample/*
 .obsidian/
 
 # Video files and directories
+inputs/*
 videos/*
 outputs/*
 
+# MacOS
+.DS_Store
