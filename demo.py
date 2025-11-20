@@ -33,7 +33,9 @@ from util import run_lpd_inference, run_lpr_inference
 # ========= ターミナル用カラー定義 =========
 COLOR_GREEN = "\033[92m"
 COLOR_YELLOW = "\033[93m"
+COLOR_RED = "\033[91m"
 COLOR_RESET = "\033[0m"
+
 # ======================================
 
 
@@ -391,8 +393,10 @@ def main() -> None:
             "UNREAD",
         )
         print(
-            f"  -> UNREAD saved for segment: {segment_best_unread_rel_path} "
+            COLOR_RED
+            + f"  -> UNREAD saved for segment: {segment_best_unread_rel_path} "
             f"(width={segment_best_unread_width}, path={unread_rel_path})"
+            + COLOR_RESET
         )
 
     print("Start processing images...")
