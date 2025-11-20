@@ -186,6 +186,9 @@ sample/*
 inputs/*
 videos/*
 outputs/*
+output/*
+images/*
 
 # MacOS
 .DS_Store
+
