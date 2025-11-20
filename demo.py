@@ -8,6 +8,11 @@
 確定したナンバーについては、元画像のナンバープレート付近に
 そのナンバーをテキスト描画して保存し、そのパスも CSV に書き込む。
 
+さらに、
+- ナンバープレートが写っているフレームが連続している区間（segment）ごとに見て、
+- その segment 内で一度も CONFIRM にならなかった場合、
+  その segment の中で一番プレートが大きかったフレームを "UNREAD"（赤文字）として保存する。
+
 - 入力: ディレクトリ (--input_dir)
 - 出力: CSV ファイル (--csv_output, デフォルト: serial_numbers.csv)
 - モデル: PlateYOLO-JP (LPD) + EkMixer (LPR) の ONNX
@@ -241,6 +246,8 @@ def save_annotated_image(
     """
     フレームのナンバープレート付近に serial を文字で描画し、
     画像を保存して、そのパス（相対パス）を返す。
+
+    serial に "UNREAD" が来た場合は赤文字、それ以外（4桁番号）は緑文字で描画する。
     """
     os.makedirs(annotated_dir, exist_ok=True)
 
@@ -258,7 +265,13 @@ def save_annotated_image(
     text_x = max(0, x1)
     text_y = max(text_h + 5, y1 - 5)
 
-    # 文字が見やすいように、薄い黒枠の上に白文字 → その上に色文字
+    # UNREAD だけ赤にする
+    if serial == "UNREAD":
+        text_color = (0, 0, 255)  # 赤 (B, G, R)
+    else:
+        text_color = (0, 255, 0)  # 緑
+
+    # 文字が見やすいように、薄い黒枠の上に色文字
     cv2.putText(
         annotated,
         text,
@@ -275,7 +288,7 @@ def save_annotated_image(
         (text_x, text_y),
         font,
         font_scale,
-        (0, 255, 0),
+        text_color,
         thickness,
         cv2.LINE_AA,
     )
@@ -331,7 +344,6 @@ def main() -> None:
     _ = run_lpr_inference(lpr_model, np.zeros((200, 100, 3), dtype=np.uint8))
 
     # CSV書き込み用バッファ（確定したイベント）
-    # 列: 元画像の相対パス, 一連指定番号, 注釈付き画像パス
     rows: List[List[str]] = []
 
     # ★ 時系列の「安定判定」用の状態
@@ -340,6 +352,48 @@ def main() -> None:
 
     confirmed_last_serial: Optional[str] = None
     confirmed_last_time: Optional[float] = None
+
+    # ★ segment（プレートが写っている塊）管理用
+    segment_active: bool = False
+    segment_has_confirmed: bool = False
+    segment_best_unread_img_path: Optional[str] = None
+    segment_best_unread_rel_path: Optional[str] = None
+    segment_best_unread_bbox: Optional[Tuple[int, int, int, int]] = None
+    segment_best_unread_width: int = 0
+
+    def flush_unread_segment() -> None:
+        """現在の segment に対して、UNREAD を1枚保存（必要なら）。"""
+        nonlocal segment_active, segment_has_confirmed
+        nonlocal segment_best_unread_img_path, segment_best_unread_rel_path
+        nonlocal segment_best_unread_bbox, segment_best_unread_width
+
+        if (not segment_active) or segment_has_confirmed:
+            return
+        if (
+            segment_best_unread_img_path is None
+            or segment_best_unread_rel_path is None
+            or segment_best_unread_bbox is None
+        ):
+            return
+
+        frame_unread = cv2.imread(segment_best_unread_img_path)
+        if frame_unread is None:
+            print(
+                f"  (WARN) failed to read frame for UNREAD: {segment_best_unread_img_path}"
+            )
+            return
+
+        unread_rel_path = save_annotated_image(
+            frame_unread,
+            segment_best_unread_bbox,
+            annotated_dir,
+            segment_best_unread_rel_path,
+            "UNREAD",
+        )
+        print(
+            f"  -> UNREAD saved for segment: {segment_best_unread_rel_path} "
+            f"(width={segment_best_unread_width}, path={unread_rel_path})"
+        )
 
     print("Start processing images...")
     total = len(image_paths)
@@ -356,7 +410,58 @@ def main() -> None:
         rel_path = os.path.relpath(img_path, input_dir)
         timestamp = parse_timestamp_from_filename(img_path)
 
-        # このフレームで一番大きなプレートを1つだけ使う
+        has_plate = len(lpr_results) > 0
+
+        # ===== segment への出入りを管理 =====
+        if not has_plate:
+            # プレートが1枚も検出されなかった → segment 終了の可能性
+            if segment_active:
+                # 直前までプレートが写っていた塊がここで終わる
+                flush_unread_segment()
+                # segment リセット
+                segment_active = False
+                segment_has_confirmed = False
+                segment_best_unread_img_path = None
+                segment_best_unread_rel_path = None
+                segment_best_unread_bbox = None
+                segment_best_unread_width = 0
+                candidate_serial = None
+                candidate_count = 0
+
+            print(
+                f"[{idx}/{total}] {rel_path}: no plate detected "
+                f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms)"
+            )
+            continue
+        else:
+            # プレートが少なくとも1枚検出されている
+            if not segment_active:
+                # 新しい segment の開始
+                segment_active = True
+                segment_has_confirmed = False
+                segment_best_unread_img_path = None
+                segment_best_unread_rel_path = None
+                segment_best_unread_bbox = None
+                segment_best_unread_width = 0
+                candidate_serial = None
+                candidate_count = 0
+
+            # このフレームで最大幅のプレート（UNREAD 用候補）
+            frame_max_plate = max(lpr_results, key=lambda r: r["lp_shape"][1])
+            frame_max_width = frame_max_plate["lp_shape"][1]
+            frame_max_bbox = frame_max_plate["bbox_px"]
+
+            # まだこの segment で CONFIRM が出ていない場合のみ、UNREAD 候補を更新
+            if not segment_has_confirmed:
+                if frame_max_width > segment_best_unread_width:
+                    segment_best_unread_width = frame_max_width
+                    segment_best_unread_img_path = img_path
+                    segment_best_unread_rel_path = rel_path
+                    segment_best_unread_bbox = frame_max_bbox
+
+        # ===== ここからは「プレートはある」状態 =====
+
+        # このフレームで一番大きな「使える 4桁プレート」を探す
         best_serial: Optional[str] = None
         best_width: int = 0
         best_bbox_px: Optional[Tuple[int, int, int, int]] = None
@@ -377,15 +482,16 @@ def main() -> None:
                 best_serial = serial
                 best_bbox_px = lpr_result["bbox_px"]
 
-        # このフレームで信頼できる 4桁番号がなければスキップ
+        # このフレームで信頼できる 4桁番号がなければ
         if best_serial is None or best_bbox_px is None:
             print(
-                f"[{idx}/{total}] {rel_path}: no usable 4-digit serial "
-                f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms)"
+                f"[{idx}/{total}] {rel_path}: plate detected but no usable 4-digit serial "
+                f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, max_width={frame_max_width})"
             )
+            # segment_active のまま → 後で flush_unread_segment される可能性あり
             continue
 
-        # ★ 安定判定ロジック
+        # ===== 安定判定ロジック（ここは元のロジックとほぼ同じ） =====
         if candidate_serial == best_serial:
             candidate_count += 1
         else:
@@ -394,7 +500,8 @@ def main() -> None:
 
         # 何フレーム連続で出たら「安定」とみなすか
         if candidate_count >= confirm_frames:
-            # すでに最後に確定した番号と同じかどうか
+            segment_has_confirmed = True  # この segment では少なくとも1回 CONFIRM 出た
+
             if confirmed_last_serial is None:
                 # 初回確定 → CSV に書く & 注釈付き画像を保存
                 annotated_rel_path = save_annotated_image(
@@ -462,6 +569,10 @@ def main() -> None:
                 f"[{idx}/{total}] {rel_path}: candidate serial={best_serial} "
                 f"(count={candidate_count}, LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
             )
+
+    # ===== ループ終了時：最後の segment の後処理 =====
+    if segment_active and not segment_has_confirmed:
+        flush_unread_segment()
 
     # CSV出力
     os.makedirs(os.path.dirname(csv_output) or ".", exist_ok=True)
