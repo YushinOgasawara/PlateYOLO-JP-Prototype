@@ -25,6 +25,12 @@ import onnxruntime  # type: ignore
 
 from util import run_lpd_inference, run_lpr_inference
 
+# ========= ターミナル用カラー定義 =========
+COLOR_GREEN = "\033[92m"
+COLOR_YELLOW = "\033[93m"
+COLOR_RESET = "\033[0m"
+# ======================================
+
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -94,7 +100,6 @@ def get_args() -> argparse.Namespace:
     )
 
     # 同じ番号を再度「別イベント」として出力するまでの最小時間差（秒）
-    # （ファイル名がタイムスタンプになっている前提。0 なら時間差による再出力制限なし）
     parser.add_argument(
         "--reemit_gap",
         type=float,
@@ -253,7 +258,7 @@ def save_annotated_image(
     text_x = max(0, x1)
     text_y = max(text_h + 5, y1 - 5)
 
-    # 文字が見やすいように、薄い黒枠の上に白文字 → その上に色文字とかもあり
+    # 文字が見やすいように、薄い黒枠の上に白文字 → その上に色文字
     cv2.putText(
         annotated,
         text,
@@ -399,8 +404,10 @@ def main() -> None:
                 confirmed_last_serial = best_serial
                 confirmed_last_time = timestamp
                 print(
-                    f"[{idx}/{total}] {rel_path}: CONFIRMED serial={best_serial} "
+                    COLOR_GREEN
+                    + f"[{idx}/{total}] {rel_path}: CONFIRMED serial={best_serial} "
                     f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+                    + COLOR_RESET
                 )
             else:
                 if best_serial != confirmed_last_serial:
@@ -412,8 +419,10 @@ def main() -> None:
                     confirmed_last_serial = best_serial
                     confirmed_last_time = timestamp
                     print(
-                        f"[{idx}/{total}] {rel_path}: CONFIRMED NEW serial={best_serial} "
+                        COLOR_GREEN
+                        + f"[{idx}/{total}] {rel_path}: CONFIRMED NEW serial={best_serial} "
                         f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+                        + COLOR_RESET
                     )
                 else:
                     # 同じ番号 → 時間差を見て、十分離れていれば別イベントとして出力
@@ -430,8 +439,10 @@ def main() -> None:
                             rows.append([rel_path, best_serial, annotated_rel_path])
                             confirmed_last_time = timestamp
                             print(
-                                f"[{idx}/{total}] {rel_path}: RE-EMIT same serial={best_serial} "
+                                COLOR_YELLOW
+                                + f"[{idx}/{total}] {rel_path}: RE-EMIT same serial={best_serial} "
                                 f"(gap {gap:.1f}s, width={best_width})"
+                                + COLOR_RESET
                             )
                         else:
                             print(
