@@ -3,7 +3,7 @@
 """
 指定したディレクトリ内の全画像ファイルからナンバープレートを検出し、
 “十分大きく写っていて、かつ複数フレーム連続で同じ値になった”
-一連指定番号（4桁）だけを CSV に出力するスクリプト。
+一連指定番号（最大4桁）だけを CSV に出力するスクリプト。
 
 確定したナンバーについては、元画像のナンバープレート付近に
 そのナンバーをテキスト描画して保存し、そのパスも CSV に書き込む。
@@ -35,13 +35,12 @@ COLOR_GREEN = "\033[92m"
 COLOR_YELLOW = "\033[93m"
 COLOR_RED = "\033[91m"
 COLOR_RESET = "\033[0m"
-
 # ======================================
 
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch LPR: extract stable 4-digit serial numbers from all images in a directory."
+        description="Batch LPR: extract stable serial numbers (1–4 digits) from all images in a directory."
     )
 
     # 入力ディレクトリ
@@ -127,16 +126,17 @@ def get_args() -> argparse.Namespace:
 
 def extract_serial_number(plate_num_ids: List[int]) -> str:
     """
-    plate_num_ids から一連指定番号（4桁）だけを取り出す。
+    plate_num_ids から一連指定番号（最大4桁）だけを取り出す。
     モデルでは 10 が「空白」を表している前提で、10 は無視する。
+    1桁以上読めていれば、その末尾4桁までを返す。
     """
     digits = [str(v) for v in plate_num_ids if v != 10]
 
-    # 一連指定番号は通常4桁なので、最後の4桁だけを使う
-    if len(digits) >= 4:
+    if len(digits) >= 1:
+        # 念のため末尾4桁に制限（5桁以上が来た場合の保険）
         return "".join(digits[-4:])
     else:
-        # 読み取りが不完全な場合はスキップしたいので空文字を返す
+        # 読み取りが完全に失敗した場合だけスキップしたいので空文字を返す
         return ""
 
 
@@ -249,7 +249,7 @@ def save_annotated_image(
     フレームのナンバープレート付近に serial を文字で描画し、
     画像を保存して、そのパス（相対パス）を返す。
 
-    serial に "UNREAD" が来た場合は赤文字、それ以外（4桁番号）は緑文字で描画する。
+    serial に "UNREAD" が来た場合は赤文字、それ以外（1〜4桁の番号）は緑文字で描画する。
     """
     os.makedirs(annotated_dir, exist_ok=True)
 
@@ -465,7 +465,7 @@ def main() -> None:
 
         # ===== ここからは「プレートはある」状態 =====
 
-        # このフレームで一番大きな「使える 4桁プレート」を探す
+        # このフレームで一番大きな「使えるプレート」を探す
         best_serial: Optional[str] = None
         best_width: int = 0
         best_bbox_px: Optional[Tuple[int, int, int, int]] = None
@@ -477,7 +477,8 @@ def main() -> None:
                 continue
 
             serial = extract_serial_number(lpr_result["plate_num_ids"])
-            if len(serial) != 4:
+            if len(serial) == 0:
+                # 1桁も読めていない → 無視
                 continue
 
             # より幅の大きいプレートだけを採用
@@ -486,16 +487,16 @@ def main() -> None:
                 best_serial = serial
                 best_bbox_px = lpr_result["bbox_px"]
 
-        # このフレームで信頼できる 4桁番号がなければ
+        # このフレームで信頼できる番号がなければ
         if best_serial is None or best_bbox_px is None:
             print(
-                f"[{idx}/{total}] {rel_path}: plate detected but no usable 4-digit serial "
+                f"[{idx}/{total}] {rel_path}: plate detected but no usable serial "
                 f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, max_width={frame_max_width})"
             )
             # segment_active のまま → 後で flush_unread_segment される可能性あり
             continue
 
-        # ===== 安定判定ロジック（ここは元のロジックとほぼ同じ） =====
+        # ===== 安定判定ロジック =====
         if candidate_serial == best_serial:
             candidate_count += 1
         else:
