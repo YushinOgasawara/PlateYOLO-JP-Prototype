@@ -5,6 +5,9 @@
 “十分大きく写っていて、かつ複数フレーム連続で同じ値になった”
 一連指定番号（4桁）だけを CSV に出力するスクリプト。
 
+確定したナンバーについては、元画像のナンバープレート付近に
+そのナンバーをテキスト描画して保存し、そのパスも CSV に書き込む。
+
 - 入力: ディレクトリ (--input_dir)
 - 出力: CSV ファイル (--csv_output, デフォルト: serial_numbers.csv)
 - モデル: PlateYOLO-JP (LPD) + EkMixer (LPR) の ONNX
@@ -44,6 +47,14 @@ def get_args() -> argparse.Namespace:
         help="Output CSV file path (default: serial_numbers.csv)",
     )
 
+    # 注釈付き画像の保存先ディレクトリ
+    parser.add_argument(
+        "--annotated_dir",
+        type=str,
+        default="annotated_plates",
+        help="Directory to save annotated images",
+    )
+
     # モデルパス
     parser.add_argument(
         "--lpd",
@@ -70,7 +81,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--min_plate_width",
         type=int,
-        default=80,  # ★ 少し緩めに
+        default=40,
         help="Minimum plate width (pixels) to trust LPR result",
     )
 
@@ -125,6 +136,7 @@ def run_inference_on_frame(
 ) -> Tuple[List[dict], float, float]:
     """
     1枚の画像に対して LPD + LPR を実行し、LPR結果のリストを返す。
+    各結果には、ピクセル座標での bbox も含める。
     """
     frame_height, frame_width = frame.shape[:2]
 
@@ -167,10 +179,11 @@ def run_inference_on_frame(
 
         lpr_results.append(
             {
-                "bbox": detection_result[:4],
+                "bbox": detection_result[:4],            # 正規化座標
+                "bbox_px": (x1, y1, x2, y2),             # ピクセル座標
                 "bbox_score": detection_result[4],
                 "bbox_class_id": detection_result[5],
-                "lp_shape": lp_image.shape,  # (H, W, C)
+                "lp_shape": lp_image.shape,              # (H, W, C)
                 "hiragana_id": hiragana_id,
                 "region_id": region_id,
                 "class_num_ids": class_num_ids,
@@ -213,11 +226,71 @@ def parse_timestamp_from_filename(path: str) -> Optional[float]:
         return None
 
 
+def save_annotated_image(
+    frame: np.ndarray,
+    bbox_px: Tuple[int, int, int, int],
+    annotated_dir: str,
+    rel_path: str,
+    serial: str,
+) -> str:
+    """
+    フレームのナンバープレート付近に serial を文字で描画し、
+    画像を保存して、そのパス（相対パス）を返す。
+    """
+    os.makedirs(annotated_dir, exist_ok=True)
+
+    x1, y1, x2, y2 = bbox_px
+    annotated = frame.copy()
+
+    # テキストを書く位置（ナンバープレートの上あたり）
+    text = serial
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.0
+    thickness = 2
+
+    # テキストサイズを計算して、ちょっといい感じの位置に置く
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    text_x = max(0, x1)
+    text_y = max(text_h + 5, y1 - 5)
+
+    # 文字が見やすいように、薄い黒枠の上に白文字 → その上に色文字とかもあり
+    cv2.putText(
+        annotated,
+        text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (0, 0, 0),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        annotated,
+        text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    base_name = os.path.splitext(os.path.basename(rel_path))[0]
+    out_name = f"{base_name}_annotated_{serial}.jpg"
+    out_path = os.path.join(annotated_dir, out_name)
+
+    cv2.imwrite(out_path, annotated)
+
+    # CSV にはプロジェクトルートからの相対パスで入れておく
+    return os.path.relpath(out_path)
+
+
 def main() -> None:
     args = get_args()
 
     input_dir: str = args.input_dir
     csv_output: str = args.csv_output
+    annotated_dir: str = args.annotated_dir
     lpd_model_path: str = args.lpd
     lpr_model_path: str = args.lpr
     lpd_score_th: float = args.lpd_score_th
@@ -253,6 +326,7 @@ def main() -> None:
     _ = run_lpr_inference(lpr_model, np.zeros((200, 100, 3), dtype=np.uint8))
 
     # CSV書き込み用バッファ（確定したイベント）
+    # 列: 元画像の相対パス, 一連指定番号, 注釈付き画像パス
     rows: List[List[str]] = []
 
     # ★ 時系列の「安定判定」用の状態
@@ -280,6 +354,7 @@ def main() -> None:
         # このフレームで一番大きなプレートを1つだけ使う
         best_serial: Optional[str] = None
         best_width: int = 0
+        best_bbox_px: Optional[Tuple[int, int, int, int]] = None
 
         for lpr_result in lpr_results:
             h, w, _ = lpr_result["lp_shape"]
@@ -295,10 +370,10 @@ def main() -> None:
             if w > best_width:
                 best_width = w
                 best_serial = serial
+                best_bbox_px = lpr_result["bbox_px"]
 
-        # このフレームで信頼できる 4桁番号がなければ、
-        # ★ 候補はリセットせず、単に「読めなかった」としてスキップ
-        if best_serial is None:
+        # このフレームで信頼できる 4桁番号がなければスキップ
+        if best_serial is None or best_bbox_px is None:
             print(
                 f"[{idx}/{total}] {rel_path}: no usable 4-digit serial "
                 f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms)"
@@ -316,8 +391,11 @@ def main() -> None:
         if candidate_count >= confirm_frames:
             # すでに最後に確定した番号と同じかどうか
             if confirmed_last_serial is None:
-                # 初回確定
-                rows.append([rel_path, best_serial])
+                # 初回確定 → CSV に書く & 注釈付き画像を保存
+                annotated_rel_path = save_annotated_image(
+                    frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                )
+                rows.append([rel_path, best_serial, annotated_rel_path])
                 confirmed_last_serial = best_serial
                 confirmed_last_time = timestamp
                 print(
@@ -327,7 +405,10 @@ def main() -> None:
             else:
                 if best_serial != confirmed_last_serial:
                     # 異なる番号 → 新しい車として出力
-                    rows.append([rel_path, best_serial])
+                    annotated_rel_path = save_annotated_image(
+                        frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                    )
+                    rows.append([rel_path, best_serial, annotated_rel_path])
                     confirmed_last_serial = best_serial
                     confirmed_last_time = timestamp
                     print(
@@ -343,7 +424,10 @@ def main() -> None:
                     ):
                         gap = timestamp - confirmed_last_time
                         if gap >= reemit_gap:
-                            rows.append([rel_path, best_serial])
+                            annotated_rel_path = save_annotated_image(
+                                frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                            )
+                            rows.append([rel_path, best_serial, annotated_rel_path])
                             confirmed_last_time = timestamp
                             print(
                                 f"[{idx}/{total}] {rel_path}: RE-EMIT same serial={best_serial} "
@@ -372,7 +456,7 @@ def main() -> None:
     os.makedirs(os.path.dirname(csv_output) or ".", exist_ok=True)
     with open(csv_output, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["filename", "serial_number"])  # ヘッダ
+        writer.writerow(["filename", "serial_number", "annotated_image_path"])  # ヘッダ
         writer.writerows(rows)
 
     print(f"Done. Saved {len(rows)} stable serial numbers to: {csv_output}")
