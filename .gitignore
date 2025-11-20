@@ -183,6 +183,13 @@ sample/*
 .obsidian/
 
 # Video files and directories
+inputs/*
 videos/*
 outputs/*
+output/*
+images/*
+annotated_plates/*
+
+# MacOS
+.DS_Store
 

@@ -3,6 +3,9 @@
 import copy
 import time
 import argparse
+import csv
+import datetime
+import os
 
 import cv2
 import numpy as np
@@ -19,6 +22,72 @@ from util import (
     CvDrawText,
 )
 
+
+def parse_filename(filename):
+    """
+    ファイル名から日付、時間、マシンIDを抽出
+    
+    Args:
+        filename (str): ファイル名 (例: 20241201_143052_machine01.jpg)
+        
+    Returns:
+        tuple: (date, time, machine_id) またはNoneのタプル
+    """
+    try:
+        # 拡張子を除去
+        basename = os.path.splitext(filename)[0]
+        # アンダースコアで分割
+        parts = basename.split('_')
+        
+        if len(parts) >= 3:
+            date_str = parts[0]
+            time_str = parts[1]
+            machine_id = parts[2]
+            
+            # 日付形式をYYYY-MM-DDに変換
+            if len(date_str) == 8:
+                formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                return formatted_date, time_str, machine_id
+        
+        return None, None, None
+    except Exception:
+        return None, None, None
+
+def save_to_csv(csv_path, date, machine_id, region_text, class_text, hiragana_text, plate_text):
+    """
+    ナンバープレートデータをCSVに保存
+    
+    Args:
+        csv_path (str): CSVファイルのパス
+        date (str): 撮影日 (YYYY-MM-DD)
+        machine_id (str): マシンID
+        region_text (str): 地域名
+        class_text (str): 分類番号
+        hiragana_text (str): ひらがな
+        plate_text (str): 一連指定番号
+    """
+    try:
+        # CSVファイルが存在しない場合はヘッダーを書き込む
+        write_header = not os.path.exists(csv_path)
+        
+        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['date', 'machine_id', 'issuing_office_place', 'vehicle_class_code', 'hiragana_characters', '4_numerical_digit_number']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            if write_header:
+                writer.writeheader()
+            
+            writer.writerow({
+                'date': date,
+                'machine_id': machine_id,
+                'issuing_office_place': region_text,
+                'vehicle_class_code': class_text,
+                'hiragana_characters': hiragana_text,
+                '4_numerical_digit_number': plate_text
+            })
+            
+    except Exception as e:
+        print(f"CSV保存エラー: {e}")
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -54,6 +123,9 @@ def get_args() -> argparse.Namespace:
 
     parser.add_argument("--use_privacy_mode", action="store_true")
 
+    parser.add_argument("--csv_output", type=str, default="license_plates.csv")
+    parser.add_argument("--inputs_dir", type=str, default="inputs")
+
     args = parser.parse_args()
 
     return args
@@ -86,6 +158,9 @@ def main() -> None:
     output_path: str = args.output
 
     use_privacy_mode: bool = args.use_privacy_mode
+
+    csv_output_path: str = args.csv_output
+    inputs_dir: str = args.inputs_dir
 
     # ONNXモデルの読み込み
     lpd_model = onnxruntime.InferenceSession(lpd_model_path, providers=providers)
@@ -198,6 +273,92 @@ def main() -> None:
     if use_video_writer and video_writer is not None:
         video_writer.release()
     cv2.destroyAllWindows()
+
+    # inputsディレクトリからの画像処理とCSV保存
+    if os.path.exists(inputs_dir):
+        print(f"\ninputsディレクトリを処理中: {inputs_dir}")
+        
+        # 日付ディレクトリを検索
+        for date_dir in os.listdir(inputs_dir):
+            date_path = os.path.join(inputs_dir, date_dir)
+            if os.path.isdir(date_path):
+                print(f"日付ディレクトリを処理中: {date_dir}")
+                
+                # 画像ファイルを検索
+                for filename in os.listdir(date_path):
+                    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        image_file_path = os.path.join(date_path, filename)
+                        
+                        # ファイル名から情報を抽出
+                        date, time_str, machine_id = parse_filename(filename)
+                        if date is None or machine_id is None:
+                            print(f"ファイル名の解析に失敗: {filename}")
+                            continue
+                        
+                        # 画像を読み込み
+                        frame = cv2.imread(image_file_path)
+                        if frame is None:
+                            print(f"画像の読み込みに失敗: {image_file_path}")
+                            continue
+                        
+                        frame_height, frame_width = frame.shape[:2]
+                        
+                        # ナンバープレート検出
+                        detection_results = run_lpd_inference(lpd_model, frame, lpd_score_th)
+                        
+                        # ナンバープレート認識
+                        for detection_result in detection_results:
+                            # 切り抜き
+                            offset = 0
+                            x1: int = int(detection_result[0] * frame_width) - offset
+                            y1: int = int(detection_result[1] * frame_height) - offset
+                            x2: int = int(detection_result[2] * frame_width) + offset
+                            y2: int = int(detection_result[3] * frame_height) + offset
+                            lp_image = frame[y1:y2, x1:x2]
+                            
+                            if lp_image.shape[0] <= 0 or lp_image.shape[1] <= 0:
+                                continue
+                            
+                            # 推論
+                            hiragana_id, region_id, class_num_ids, plate_num_ids = run_lpr_inference(
+                                lpr_model, lp_image
+                            )
+                            
+                            # ナンバープレート情報を文字列に変換
+                            region_dict_inv = {v: k for k, v in region_dict.items()}
+                            hiragana_dict_inv = {v: k for k, v in hiragana_dict.items()}
+                            class_num_01_dict_inv = {v: k for k, v in class_num_01_dict.items()}
+                            class_num_02_dict_inv = {v: k for k, v in class_num_02_dict.items()}
+                            class_num_03_dict_inv = {v: k for k, v in class_num_03_dict.items()}
+                            
+                            # 地域名
+                            region_text = region_dict_inv.get(region_id, "")
+                            
+                            # ひらがな
+                            hiragana_text = hiragana_dict_inv.get(hiragana_id, "")
+                            
+                            # 分類番号
+                            class_text = ""
+                            if class_num_ids[0] < len(class_num_01_dict_inv):
+                                class_text += class_num_01_dict_inv[class_num_ids[0]]
+                            if class_num_ids[1] < len(class_num_02_dict_inv):
+                                class_text += class_num_02_dict_inv[class_num_ids[1]]
+                            if class_num_ids[2] < len(class_num_03_dict_inv):
+                                class_text += class_num_03_dict_inv[class_num_ids[2]]
+                            
+                            # 一連指定番号
+                            plate_text = ""
+                            for plate_value in plate_num_ids:
+                                if plate_value != 10:
+                                    plate_text += str(plate_value)
+                            
+                            # CSVに保存
+                            save_to_csv(csv_output_path, date, machine_id, region_text, class_text, hiragana_text, plate_text)
+                            print(f"CSV保存完了: {filename} -> {region_text} {class_text} {hiragana_text} {plate_text}")
+        
+        print(f"CSV出力完了: {csv_output_path}")
+    else:
+        print(f"inputsディレクトリが見つかりません: {inputs_dir}")
 
 
 def draw_info(

@@ -1,359 +1,465 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import copy
-import time
+"""
+指定したディレクトリ内の全画像ファイルからナンバープレートを検出し、
+“十分大きく写っていて、かつ複数フレーム連続で同じ値になった”
+一連指定番号（4桁）だけを CSV に出力するスクリプト。
+
+確定したナンバーについては、元画像のナンバープレート付近に
+そのナンバーをテキスト描画して保存し、そのパスも CSV に書き込む。
+
+- 入力: ディレクトリ (--input_dir)
+- 出力: CSV ファイル (--csv_output, デフォルト: serial_numbers.csv)
+- モデル: PlateYOLO-JP (LPD) + EkMixer (LPR) の ONNX
+"""
+
 import argparse
+import csv
+import os
+import time
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
-import onnxruntime  # type:ignore
+import onnxruntime  # type: ignore
 
-from util import (
-    region_dict,
-    hiragana_dict,
-    class_num_01_dict,
-    class_num_02_dict,
-    class_num_03_dict,
-    run_lpd_inference,
-    run_lpr_inference,
-    CvDrawText,
-)
+from util import run_lpd_inference, run_lpr_inference
 
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Batch LPR: extract stable 4-digit serial numbers from all images in a directory."
+    )
 
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--video", type=str, default=None)
-    parser.add_argument("--image", type=str, default=None)
-    parser.add_argument("--width", help="cap width", type=int, default=960)
-    parser.add_argument("--height", help="cap height", type=int, default=540)
+    # 入力ディレクトリ
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory containing images to process",
+    )
 
+    # 出力 CSV
+    parser.add_argument(
+        "--csv_output",
+        type=str,
+        default="serial_numbers.csv",
+        help="Output CSV file path (default: serial_numbers.csv)",
+    )
+
+    # 注釈付き画像の保存先ディレクトリ
+    parser.add_argument(
+        "--annotated_dir",
+        type=str,
+        default="annotated_plates",
+        help="Directory to save annotated images",
+    )
+
+    # モデルパス
     parser.add_argument(
         "--lpd",
         type=str,
-        # default="weight/PlateYOLO-JP-320x320.onnx",
-        default="weight/PlateYOLO-JP-640x640.onnx",
-        # default="weight/PlateYOLO-JP-1280x1280.onnx",
-        # default="weight/PlateYOLO-JP-1920x1920.onnx",
+        default="weight/PlateYOLO-JP-1920x1920.onnx",
+        help="Path to LPD (PlateYOLO-JP) ONNX model",
     )
     parser.add_argument(
         "--lpr",
         type=str,
         default="weight/EkMixer-128x128.onnx",
+        help="Path to LPR (EkMixer) ONNX model",
     )
 
-    parser.add_argument("--lpd_score_th", type=float, default=0.3)
-    parser.add_argument("--lpr_min_width1", type=int, default=110)
-    parser.add_argument("--lpr_min_width2", type=int, default=150)
+    # 検出スコア閾値
+    parser.add_argument(
+        "--lpd_score_th",
+        type=float,
+        default=0.3,
+        help="Score threshold for plate detection",
+    )
 
-    parser.add_argument("--use_video_writer", action="store_true")
-    parser.add_argument("--output", type=str, default="output.avi")
+    # プレート幅フィルタ（小さすぎるプレートは無視）
+    parser.add_argument(
+        "--min_plate_width",
+        type=int,
+        default=40,
+        help="Minimum plate width (pixels) to trust LPR result",
+    )
 
-    parser.add_argument("--use_gpu", action="store_true")
+    # 何フレーム連続で同じ番号が出たら「確定」とみなすか
+    parser.add_argument(
+        "--confirm_frames",
+        type=int,
+        default=3,
+        help="Number of consecutive frames with the same serial required to confirm it",
+    )
 
-    parser.add_argument("--use_privacy_mode", action="store_true")
+    # 同じ番号を再度「別イベント」として出力するまでの最小時間差（秒）
+    # （ファイル名がタイムスタンプになっている前提。0 なら時間差による再出力制限なし）
+    parser.add_argument(
+        "--reemit_gap",
+        type=float,
+        default=10.0,
+        help="Minimum seconds between emitting the same serial again as a new event (0 to disable)",
+    )
+
+    # GPU を使うかどうか
+    parser.add_argument(
+        "--use_gpu",
+        action="store_true",
+        help="Use CUDAExecutionProvider if available",
+    )
 
     args = parser.parse_args()
-
     return args
 
 
+def extract_serial_number(plate_num_ids: List[int]) -> str:
+    """
+    plate_num_ids から一連指定番号（4桁）だけを取り出す。
+    モデルでは 10 が「空白」を表している前提で、10 は無視する。
+    """
+    digits = [str(v) for v in plate_num_ids if v != 10]
+
+    # 一連指定番号は通常4桁なので、最後の4桁だけを使う
+    if len(digits) >= 4:
+        return "".join(digits[-4:])
+    else:
+        # 読み取りが不完全な場合はスキップしたいので空文字を返す
+        return ""
+
+
+def run_inference_on_frame(
+    frame: np.ndarray,
+    lpd_model: onnxruntime.InferenceSession,
+    lpr_model: onnxruntime.InferenceSession,
+    lpd_score_th: float,
+) -> Tuple[List[dict], float, float]:
+    """
+    1枚の画像に対して LPD + LPR を実行し、LPR結果のリストを返す。
+    各結果には、ピクセル座標での bbox も含める。
+    """
+    frame_height, frame_width = frame.shape[:2]
+
+    # ナンバープレート検出
+    lpd_start_time = time.perf_counter()
+    detection_results = run_lpd_inference(lpd_model, frame, lpd_score_th)
+    lpd_end_time = time.perf_counter()
+    lpd_elapsed_time = (lpd_end_time - lpd_start_time) * 1000.0
+
+    # ナンバープレート認識
+    lpr_start_time = time.perf_counter()
+    lpr_results: List[dict] = []
+
+    for detection_result in detection_results:
+        # 切り抜き
+        offset = 0
+        x1: int = int(detection_result[0] * frame_width) - offset
+        y1: int = int(detection_result[1] * frame_height) - offset
+        x2: int = int(detection_result[2] * frame_width) + offset
+        y2: int = int(detection_result[3] * frame_height) + offset
+
+        # 一応クリップ
+        x1 = max(0, min(frame_width - 1, x1))
+        y1 = max(0, min(frame_height - 1, y1))
+        x2 = max(0, min(frame_width, x2))
+        y2 = max(0, min(frame_height, y2))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        lp_image = frame[y1:y2, x1:x2]
+
+        if lp_image.shape[0] <= 0 or lp_image.shape[1] <= 0:
+            continue
+
+        # LPR 推論
+        hiragana_id, region_id, class_num_ids, plate_num_ids = run_lpr_inference(
+            lpr_model, lp_image
+        )
+
+        lpr_results.append(
+            {
+                "bbox": detection_result[:4],            # 正規化座標
+                "bbox_px": (x1, y1, x2, y2),             # ピクセル座標
+                "bbox_score": detection_result[4],
+                "bbox_class_id": detection_result[5],
+                "lp_shape": lp_image.shape,              # (H, W, C)
+                "hiragana_id": hiragana_id,
+                "region_id": region_id,
+                "class_num_ids": class_num_ids,
+                "plate_num_ids": plate_num_ids,
+            }
+        )
+
+    lpr_end_time = time.perf_counter()
+    lpr_elapsed_time = (lpr_end_time - lpr_start_time) * 1000.0
+
+    return lpr_results, lpd_elapsed_time, lpr_elapsed_time
+
+
+def collect_image_files(input_dir: str) -> List[str]:
+    """
+    ディレクトリ以下の全ての画像ファイルパスを再帰的に集める。
+    """
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    image_paths: List[str] = []
+
+    for root, _, files in os.walk(input_dir):
+        for name in files:
+            if name.lower().endswith(exts):
+                image_paths.append(os.path.join(root, name))
+
+    image_paths.sort()
+    return image_paths
+
+
+def parse_timestamp_from_filename(path: str) -> Optional[float]:
+    """
+    ファイル名が "1763592881.616423.jpg" のように
+    「UNIXタイム(っぽい数値).拡張子」である前提で float に変換して返す。
+    そうでない場合は None。
+    """
+    base = os.path.splitext(os.path.basename(path))[0]
+    try:
+        return float(base)
+    except ValueError:
+        return None
+
+
+def save_annotated_image(
+    frame: np.ndarray,
+    bbox_px: Tuple[int, int, int, int],
+    annotated_dir: str,
+    rel_path: str,
+    serial: str,
+) -> str:
+    """
+    フレームのナンバープレート付近に serial を文字で描画し、
+    画像を保存して、そのパス（相対パス）を返す。
+    """
+    os.makedirs(annotated_dir, exist_ok=True)
+
+    x1, y1, x2, y2 = bbox_px
+    annotated = frame.copy()
+
+    # テキストを書く位置（ナンバープレートの上あたり）
+    text = serial
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.0
+    thickness = 2
+
+    # テキストサイズを計算して、ちょっといい感じの位置に置く
+    (text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    text_x = max(0, x1)
+    text_y = max(text_h + 5, y1 - 5)
+
+    # 文字が見やすいように、薄い黒枠の上に白文字 → その上に色文字とかもあり
+    cv2.putText(
+        annotated,
+        text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (0, 0, 0),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        annotated,
+        text,
+        (text_x, text_y),
+        font,
+        font_scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    base_name = os.path.splitext(os.path.basename(rel_path))[0]
+    out_name = f"{base_name}_annotated_{serial}.jpg"
+    out_path = os.path.join(annotated_dir, out_name)
+
+    cv2.imwrite(out_path, annotated)
+
+    # CSV にはプロジェクトルートからの相対パスで入れておく
+    return os.path.relpath(out_path)
+
+
 def main() -> None:
-    # 引数解析
     args = get_args()
 
-    device: int = args.device
-    cap_width: int = args.width
-    cap_height: int = args.height
-
-    if args.video is not None:
-        video_path: str = args.video
-    image_path: str = args.image
-
+    input_dir: str = args.input_dir
+    csv_output: str = args.csv_output
+    annotated_dir: str = args.annotated_dir
     lpd_model_path: str = args.lpd
     lpr_model_path: str = args.lpr
-
     lpd_score_th: float = args.lpd_score_th
-    lpr_min_width1: int = args.lpr_min_width1
-    lpr_min_width2: int = args.lpr_min_width2
+    min_plate_width: int = args.min_plate_width
+    confirm_frames: int = args.confirm_frames
+    reemit_gap: float = args.reemit_gap
 
-    providers: list[str] = ["CPUExecutionProvider"]
+    # 画像一覧取得
+    image_paths = collect_image_files(input_dir)
+    if not image_paths:
+        print(f"No image files found in: {input_dir}")
+        return
+
+    print(f"Found {len(image_paths)} image files in {input_dir}")
+    print(
+        f"Params: lpd_th={lpd_score_th}, min_plate_width={min_plate_width}, "
+        f"confirm_frames={confirm_frames}, reemit_gap={reemit_gap}"
+    )
+
+    # ONNX providers
+    providers: List[str] = ["CPUExecutionProvider"]
     if args.use_gpu:
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-    use_video_writer: bool = args.use_video_writer
-    output_path: str = args.output
-
-    use_privacy_mode: bool = args.use_privacy_mode
-
     # ONNXモデルの読み込み
+    print("Loading ONNX models...")
     lpd_model = onnxruntime.InferenceSession(lpd_model_path, providers=providers)
     lpr_model = onnxruntime.InferenceSession(lpr_model_path, providers=providers)
 
-    # VideoCapture準備
-    if args.video is None:
-        cap = cv2.VideoCapture(device)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cap_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cap_height)
-    else:
-        cap = cv2.VideoCapture(video_path)
-    cap_fps = cap.get(cv2.CAP_PROP_FPS)
-
-    # VideoWriter準備
-    video_writer = None
-
     # ウォームアップ
-    _ = run_lpd_inference(lpd_model, np.zeros((960, 540, 3), dtype=np.uint8), 0.3)
+    print("Warming up models...")
+    _ = run_lpd_inference(lpd_model, np.zeros((1920, 1080, 3), dtype=np.uint8), 0.3)
     _ = run_lpr_inference(lpr_model, np.zeros((200, 100, 3), dtype=np.uint8))
 
-    while True:
-        if image_path is None:
-            ret, frame = cap.read()
-            if not ret:
-                break
-        else:
-            frame = cv2.imread(image_path)
-        frame_height, frame_width = frame.shape[:2]
+    # CSV書き込み用バッファ（確定したイベント）
+    # 列: 元画像の相対パス, 一連指定番号, 注釈付き画像パス
+    rows: List[List[str]] = []
 
-        # ナンバープレート検出
-        lpd_start_time = time.perf_counter()
-        detection_results = run_lpd_inference(lpd_model, frame, lpd_score_th)
-        lpd_end_time = time.perf_counter()
-        lpd_elapsed_time = (lpd_end_time - lpd_start_time) * 1000
+    # ★ 時系列の「安定判定」用の状態
+    candidate_serial: Optional[str] = None
+    candidate_count: int = 0
 
-        # ナンバープレート認識
-        lpr_start_time = time.perf_counter()
-        lpr_results = []
-        for detection_result in detection_results:
-            # 切り抜き
-            offset = 0
-            x1: int = int(detection_result[0] * frame_width) - offset
-            y1: int = int(detection_result[1] * frame_height) - offset
-            x2: int = int(detection_result[2] * frame_width) + offset
-            y2: int = int(detection_result[3] * frame_height) + offset
-            lp_image = frame[y1:y2, x1:x2]
+    confirmed_last_serial: Optional[str] = None
+    confirmed_last_time: Optional[float] = None
 
-            if lp_image.shape[0] <= 0 or lp_image.shape[1] <= 0:
+    print("Start processing images...")
+    total = len(image_paths)
+    for idx, img_path in enumerate(image_paths, start=1):
+        frame = cv2.imread(img_path)
+        if frame is None:
+            print(f"[{idx}/{total}] Failed to read image: {img_path}")
+            continue
+
+        lpr_results, lpd_time, lpr_time = run_inference_on_frame(
+            frame, lpd_model, lpr_model, lpd_score_th
+        )
+
+        rel_path = os.path.relpath(img_path, input_dir)
+        timestamp = parse_timestamp_from_filename(img_path)
+
+        # このフレームで一番大きなプレートを1つだけ使う
+        best_serial: Optional[str] = None
+        best_width: int = 0
+        best_bbox_px: Optional[Tuple[int, int, int, int]] = None
+
+        for lpr_result in lpr_results:
+            h, w, _ = lpr_result["lp_shape"]
+            if w < min_plate_width:
+                # 遠すぎて小さいプレートは無視
                 continue
 
-            # 推論
-            hiragana_id, region_id, class_num_ids, plate_num_ids = run_lpr_inference(
-                lpr_model, lp_image
+            serial = extract_serial_number(lpr_result["plate_num_ids"])
+            if len(serial) != 4:
+                continue
+
+            # より幅の大きいプレートだけを採用
+            if w > best_width:
+                best_width = w
+                best_serial = serial
+                best_bbox_px = lpr_result["bbox_px"]
+
+        # このフレームで信頼できる 4桁番号がなければスキップ
+        if best_serial is None or best_bbox_px is None:
+            print(
+                f"[{idx}/{total}] {rel_path}: no usable 4-digit serial "
+                f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms)"
             )
+            continue
 
-            lpr_results.append(
-                {
-                    "bbox": detection_result[:4],
-                    "bbox_score": detection_result[4],
-                    "bbox_class_id": detection_result[5],
-                    "lp_shape": lp_image.shape,
-                    "hiragana_id": hiragana_id,
-                    "region_id": region_id,
-                    "class_num_ids": class_num_ids,
-                    "plate_num_ids": plate_num_ids,
-                }
-            )
-        lpr_end_time = time.perf_counter()
-        lpr_elapsed_time = (lpr_end_time - lpr_start_time) * 1000
-
-        # デバッグ表示
-        debug_image = draw_info(
-            frame,
-            lpr_results,
-            lpd_elapsed_time,
-            lpr_elapsed_time,
-            region_dict,
-            hiragana_dict,
-            class_num_01_dict,
-            class_num_02_dict,
-            class_num_03_dict,
-            lpr_min_width1,
-            lpr_min_width2,
-            use_privacy_mode,
-        )
-
-        cv2.imshow("LPR Demo", debug_image)
-        if image_path is None:
-            if cv2.waitKey(1) == 27:  # ESC
-                break
+        # ★ 安定判定ロジック
+        if candidate_serial == best_serial:
+            candidate_count += 1
         else:
-            cv2.waitKey(-1)
-            break
+            candidate_serial = best_serial
+            candidate_count = 1
 
-        # 動画書き込み
-        if use_video_writer and video_writer is None:
-            debug_width = debug_image.shape[1]
-            debug_height = debug_image.shape[0]
-            video_writer = cv2.VideoWriter(
-                output_path,
-                cv2.VideoWriter_fourcc(*"MJPG"),
-                int(cap_fps),
-                (debug_width, debug_height),
-            )
-        if use_video_writer:
-            video_writer.write(debug_image)  # type:ignore
-
-    cap.release()
-    if use_video_writer and video_writer is not None:
-        video_writer.release()
-    cv2.destroyAllWindows()
-
-
-def draw_info(
-    image,
-    lpr_results,
-    lpd_elapsed_time,
-    lpr_elapsed_time,
-    region_dict,
-    hiragana_dict,
-    class_num_01_dict,
-    class_num_02_dict,
-    class_num_03_dict,
-    lpr_min_width1,
-    lpr_min_width2,
-    use_privacy_mode,
-    resize_width=960,
-    font_path="./font/gensen-font/ttc/GenSenRounded2-B.ttc",
-):
-    debug_image = copy.deepcopy(image)
-
-    # サイズ調整
-    debug_image = cv2.resize(
-        debug_image,
-        (resize_width, int(debug_image.shape[0] * resize_width / debug_image.shape[1])),
-    )
-    image_height, image_width = debug_image.shape[:2]
-
-    # ナンバープレートID定義
-    region_dict_inv = {v: k for k, v in region_dict.items()}
-    hiragana_dict_inv = {v: k for k, v in hiragana_dict.items()}
-    class_num_01_dict_inv = {v: k for k, v in class_num_01_dict.items()}
-    class_num_02_dict_inv = {v: k for k, v in class_num_02_dict.items()}
-    class_num_03_dict_inv = {v: k for k, v in class_num_03_dict.items()}
-
-    for lpr_result in lpr_results:
-        # バウンディングボックス
-        x1 = int(lpr_result["bbox"][0] * image_width)
-        y1 = int(lpr_result["bbox"][1] * image_height)
-        x2 = int(lpr_result["bbox"][2] * image_width)
-        y2 = int(lpr_result["bbox"][3] * image_height)
-        if not use_privacy_mode:
-            cv2.rectangle(debug_image, (x1, y1), (x2, y2), (0, 255, 0), 1)
-        else:
-            cv2.rectangle(debug_image, (x1, y1), (x2, y2), (0, 255, 0), -1)
-
-        # ナンバープレートサイズ
-        lp_shape = lpr_result["lp_shape"]
-        lp_width = lp_shape[1]
-
-        # ナンバープレート：地域名
-        region_text = region_dict_inv.get(lpr_result["region_id"], 0)
-
-        if lpr_min_width1 > lp_width:
-            region_text = ""
-        elif lpr_min_width2 > lp_width:
-            region_text = "読取不可"
-
-        # ナンバープレート：ひらがな
-        hiragana_text = hiragana_dict_inv.get(lpr_result["hiragana_id"], 0)
-
-        if lpr_min_width1 > lp_width:
-            hiragana_text = "読取不可"
-        elif lpr_min_width2 > lp_width:
-            hiragana_text = "読取不可"
-
-        # ナンバープレート：分類番号
-        class_text = ""
-        if lpr_result["class_num_ids"][0] < len(class_num_01_dict_inv):
-            class_text += class_num_01_dict_inv[lpr_result["class_num_ids"][0]]
-        if lpr_result["class_num_ids"][1] < len(class_num_02_dict_inv):
-            if not use_privacy_mode:
-                class_text += class_num_02_dict_inv[lpr_result["class_num_ids"][1]]
+        # 何フレーム連続で出たら「安定」とみなすか
+        if candidate_count >= confirm_frames:
+            # すでに最後に確定した番号と同じかどうか
+            if confirmed_last_serial is None:
+                # 初回確定 → CSV に書く & 注釈付き画像を保存
+                annotated_rel_path = save_annotated_image(
+                    frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                )
+                rows.append([rel_path, best_serial, annotated_rel_path])
+                confirmed_last_serial = best_serial
+                confirmed_last_time = timestamp
+                print(
+                    f"[{idx}/{total}] {rel_path}: CONFIRMED serial={best_serial} "
+                    f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+                )
             else:
-                class_text += "X"
-        if lpr_result["class_num_ids"][2] < len(class_num_03_dict_inv):
-            if not use_privacy_mode:
-                class_text += class_num_03_dict_inv[lpr_result["class_num_ids"][2]]
-            else:
-                class_text += "X"
-
-        if lpr_min_width1 > lp_width:
-            class_text = ""
-        elif lpr_min_width2 > lp_width:
-            class_text = "読取不可"
-
-        # ナンバープレート：一連指定番号
-        plate_text = ""
-        for plate_num_index, plate_value in enumerate(lpr_result["plate_num_ids"]):
-            if not use_privacy_mode:
-                if plate_value != 10:
-                    plate_text += str(plate_value)
-            else:
-                if plate_num_index < 3:
-                    plate_text += "X"
+                if best_serial != confirmed_last_serial:
+                    # 異なる番号 → 新しい車として出力
+                    annotated_rel_path = save_annotated_image(
+                        frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                    )
+                    rows.append([rel_path, best_serial, annotated_rel_path])
+                    confirmed_last_serial = best_serial
+                    confirmed_last_time = timestamp
+                    print(
+                        f"[{idx}/{total}] {rel_path}: CONFIRMED NEW serial={best_serial} "
+                        f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+                    )
                 else:
-                    if plate_value != 10:
-                        plate_text += str(plate_value)
+                    # 同じ番号 → 時間差を見て、十分離れていれば別イベントとして出力
+                    if (
+                        reemit_gap > 0
+                        and timestamp is not None
+                        and confirmed_last_time is not None
+                    ):
+                        gap = timestamp - confirmed_last_time
+                        if gap >= reemit_gap:
+                            annotated_rel_path = save_annotated_image(
+                                frame, best_bbox_px, annotated_dir, rel_path, best_serial
+                            )
+                            rows.append([rel_path, best_serial, annotated_rel_path])
+                            confirmed_last_time = timestamp
+                            print(
+                                f"[{idx}/{total}] {rel_path}: RE-EMIT same serial={best_serial} "
+                                f"(gap {gap:.1f}s, width={best_width})"
+                            )
+                        else:
+                            print(
+                                f"[{idx}/{total}] {rel_path}: same confirmed serial={best_serial} "
+                                f"(gap {gap:.1f}s, width={best_width})"
+                            )
+                    else:
+                        # 時間情報が取れない場合や reemit_gap=0 の場合は、
+                        # すでに確定済みの同じナンバーとしてログだけ出す
+                        print(
+                            f"[{idx}/{total}] {rel_path}: same confirmed serial={best_serial} "
+                            f"(LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+                        )
+        else:
+            # まだ安定していない候補
+            print(
+                f"[{idx}/{total}] {rel_path}: candidate serial={best_serial} "
+                f"(count={candidate_count}, LPD:{lpd_time:.0f}ms, LPR:{lpr_time:.0f}ms, width={best_width})"
+            )
 
-        if lpr_min_width1 > lp_width:
-            plate_text = ""
+    # CSV出力
+    os.makedirs(os.path.dirname(csv_output) or ".", exist_ok=True)
+    with open(csv_output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "serial_number", "annotated_image_path"])  # ヘッダ
+        writer.writerows(rows)
 
-        # ナンバープレート情報描画
-        # debug_image = CvDrawText.puttext(
-        #     debug_image,
-        #     "width:" + str(lp_width),
-        #     (x1, y1 - 45 -2),
-        #     font_path,
-        #     15,
-        #     (0, 255, 0),  # RGB
-        # )
-        debug_image = CvDrawText.puttext(
-            debug_image,
-            region_text + " " + class_text,
-            (x1, y1 - 30 - 2),
-            font_path,
-            15,
-            (0, 255, 0),  # RGB
-        )
-        debug_image = CvDrawText.puttext(
-            debug_image,
-            hiragana_text + " " + plate_text,
-            (x1, y1 - 15 - 2),
-            font_path,
-            15,
-            (0, 255, 0),  # RGB
-        )
-
-    # 処理時間
-    lpr_count = len(lpr_results)
-    lpr_mean_time = (lpr_elapsed_time / lpr_count) if lpr_count > 0 else 0
-    debug_image = CvDrawText.puttext(
-        debug_image,
-        f"Total:{lpd_elapsed_time + lpr_elapsed_time:.0f}ms",
-        (5, 5),
-        font_path,
-        15,
-        (0, 255, 0),  # RGB
-    )
-    debug_image = CvDrawText.puttext(
-        debug_image,
-        f"    LPD:{lpd_elapsed_time:.0f}ms",
-        (5, 20),
-        font_path,
-        15,
-        (0, 255, 0),  # RGB
-    )
-    debug_image = CvDrawText.puttext(
-        debug_image,
-        f"    LPR:{lpr_elapsed_time:.0f}ms(count:{lpr_count}, avg:{lpr_mean_time:.0f}ms)",
-        (5, 35),
-        font_path,
-        15,
-        (0, 255, 0),  # RGB
-    )
-
-    return debug_image
+    print(f"Done. Saved {len(rows)} stable serial numbers to: {csv_output}")
 
 
 if __name__ == "__main__":
