@@ -188,6 +188,7 @@ videos/*
 outputs/*
 output/*
 images/*
+annotated_plates/*
 
 # MacOS
 .DS_Store
